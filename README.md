@@ -1,29 +1,86 @@
-# Enterprise Copy Trading Platform
+# BrokersSync — Copy Trading Platform
 
-This folder is the enterprise-grade evolution of the existing copy trading backend foundation.
+An enterprise copy-trading backend and dashboard: users connect broker
+accounts as masters or followers, trades get mirrored between them in real
+time, and admins get compliance, wallet, and marketplace tooling on top.
 
-## Foundation source
-The original project under the parent folder remains the base implementation that this enterprise version extends.
+Live at **brokerssync.com**, auto-deployed from `main` (see below).
 
-## Planned architecture
-- Multi-tenant user and account management
-- Broker integrations for MT4/MT5 (via the bridge EA in `mt-bridge-ea/` - see
-  its README) and TradeLocker (native REST API, already implemented)
-- Copy trading engine with risk controls
-- Real-time market and trade streaming
-- Strategy marketplace and performance analytics
-- Admin dashboards and compliance monitoring
-- Payment, wallet, and payout flows
-- Notifications, audit trails, and reporting
+## What's implemented
 
-## Immediate next steps
-1. Review the existing backend patterns in the parent folder.
-2. Add modular service layers and repository structure.
-3. Introduce enterprise auth, RBAC, and audit logging.
-4. Build strategy risk engine and investor allocation rules.
-5. Add real-time dashboards and webhook integrations.
+- **Auth** — email/password + optional Google sign-in, JWT sessions, admin
+  role gated by `ADMIN_EMAILS` (`src/routes/auth.js`, `src/middleware/auth.js`)
+- **Broker accounts** — add/remove/restore broker accounts, duplicate-account
+  guard, symbol mappings between brokers (`src/routes/broker-accounts.js`,
+  `src/routes/symbol-mappings.js`)
+- **TradeLocker integration** — native REST API, fully implemented: login,
+  account discovery, live position polling (`src/services/tradeLockerService.js`,
+  `src/services/tradeLockerPoller.js`)
+- **MT4/MT5 integration** — via a custom Expert Advisor bridge in
+  `mt-bridge-ea/` (poll-based, since MetaTrader can't accept inbound
+  connections). **Written but not yet run against a live MT4/5 terminal** —
+  see `mt-bridge-ea/README.md` for compile/setup steps and current status.
+- **Copy engine** — master → follower trade fan-out with idempotency
+  (duplicate event de-dupe) and a risk engine for position sizing
+  (`src/services/copyEngine.js`, `src/services/copyExecutionService.js`,
+  `src/services/riskEngine.js`)
+- **Admin controls** — configurable per-user limits on masters/followers,
+  compliance monitoring (`src/routes/admin.js`, `src/services/complianceService.js`)
+- **Wallet, transfers & settlements** — internal ledger, payout review queue
+  (`src/routes/wallet.js`, `src/routes/transfers.js`, `src/routes/settlements.js`)
+- **Strategy marketplace & analytics** — listings, performance snapshots,
+  filtering (`src/routes/marketplace.js`, `src/services/strategyMarketplaceService.js`)
+- **Notifications, market data, system health, webhooks** — supporting
+  services under `src/services/` and `src/routes/`
+- Postgres for persistence (`database/schema.sql`, applied idempotently on
+  every boot — see `src/lib/db.js`), Redis for caching/queues, WebSocket for
+  live trade-feed pushes
 
-This folder is intentionally created as the enterprise branch for the platform build.
+## Local setup
 
-## Startup behavior
-The server automatically finds the next available free port when port 3000 is already occupied, which prevents startup failures in local development and multi-service environments.
+```
+npm install
+cp .env.example .env   # fill in real secrets; Postgres/Redis must be reachable
+npm run dev             # nodemon, auto-restart
+# or
+npm start
+```
+
+The server auto-picks the next free port if `PORT` (default 3000) is taken.
+
+## Testing — current status
+
+- **Unit tests**: `npm test` — 27 tests across `tests/*.test.js`, all
+  passing. These mock `pg`/Redis, so they don't need a live database.
+- **Integration smoke tests** (mocked Postgres, no real DB/network needed):
+  - `node __smoketest_idempotency.js` — duplicate trade-event handling
+  - `node __smoketest_mtbridge.js` — MT bridge command queue/poll/ack flow
+  - Both currently pass.
+- **CI**: GitHub Actions runs `npm test` on every push to `main`, then
+  deploys to the production VPS via `pm2 restart` if it's green
+  (`.github/workflows/deploy.yml`).
+
+### What's still needed before this is "tested" end-to-end
+
+1. **MT4/MT5 EA has never run against a real terminal.** It needs to be
+   compiled in MetaEditor, attached to a demo account, and walked through the
+   `mt-bridge-ea/README.md` setup once to confirm it behaves as the smoke
+   tests assume.
+2. **No integration test against a real TradeLocker account** (demo or live)
+   has been run in this repo — only unit-level mocks.
+3. **No load/soak test** of the copy engine's fan-out under multiple
+   concurrent master→follower relationships.
+4. Manual QA of the money-adjacent flows (wallet, transfers, settlements) has
+   not been exercised against a real Postgres instance in this session.
+
+## Deployment
+
+- Push to `main` → CI runs tests → on success, SSHes into the production VPS,
+  pulls, `npm ci`, and `pm2 restart brokerssync`.
+- HTTPS is terminated by Caddy in front of the Node process
+  (`.github/workflows/setup-https.yml`, one-time setup).
+
+## Compliance docs
+
+See `DISCLAIMERS.md`, `KYC_AML_POLICY.md`, `PRIVACY_POLICY.md`, and
+`TERMS_OF_SERVICE.md` at the repo root.
