@@ -106,10 +106,27 @@ router.post('/trade', async (req, res) => {
 // TradingView alerts cannot send custom headers, so this route takes the
 // account's webhook token inside the JSON body instead (alerts only go out over
 // HTTPS, and the token is only ever sent to this server).
-// Body: { token, signal: BUY | SELL | LS_UP | LS_DOWN, symbol, size, price? }
-// In memory: which position this route opened last, per account + symbol.
+// Body: { token, signal: BUY | SELL | LS_UP | LS_DOWN | PRICE, symbol, price, size? }
+// size is required for entry signals; PRICE alerts only carry the latest price.
+// Rules (see tradingViewSignalService): an entry opens two positions, the
+// opposite signal closes leg 1 and leaves leg 2 as a trailing runner.
+// In memory: the trade state this route tracks, per account + symbol.
 // (After a restart it is rebuilt from the saved events.)
 const tvOpenPositions = new Map();
+// Alerts for the same account + symbol run one at a time, so two alerts in the
+// same instant (a retry, or BUY + LS_UP on one candle) can't both see "nothing open".
+const tvLocks = new Map();
+
+function withTradingViewLock(key, task) {
+  const previous = tvLocks.get(key) || Promise.resolve();
+  const result = previous.then(task);
+  const tail = result.catch(() => {});
+  tvLocks.set(key, tail);
+  tail.then(() => {
+    if (tvLocks.get(key) === tail) tvLocks.delete(key);
+  });
+  return result;
+}
 
 router.post('/tradingview', async (req, res) => {
   const body = req.body || {};
@@ -138,64 +155,81 @@ router.post('/tradingview', async (req, res) => {
 
   const symbol = body.symbol.toUpperCase();
   const side = tradingViewSignalService.SIGNAL_SIDES[body.signal];
-  const size = Number(body.size);
-  const price = body.price === undefined || body.price === null ? null : Number(body.price);
+  const size = body.signal === 'PRICE' ? null : Number(body.size);
+  const price = Number(body.price);
   const key = `${account.id}|${symbol}`;
 
   try {
-    let open = tvOpenPositions.get(key);
-    if (open === undefined) {
-      const latest = await tradeEventService.findLatestTradingViewEvent(account.id, symbol);
-      open = latest && latest.eventType !== 'position_closed'
-        ? { side: latest.side, externalPositionId: latest.externalPositionId }
-        : null;
-    }
-
-    const actions = tradingViewSignalService.planActions(open, side);
-    if (actions.length === 0) {
-      tvOpenPositions.set(key, open);
-      return res.status(200).json({ received: true, ignored: `a ${side} position is already open` });
-    }
-
-    // Set before any await below so a second alert in the same instant sees the new state
-    let nextOpen = open;
-    for (const action of actions) {
-      if (action.type === 'close') {
-        tradeQueue.push({
-          sourceAccountId: account.id,
-          eventType: 'position_closed',
-          symbol,
-          side: null,
-          size: null,
-          price,
-          sl: null,
-          tp: null,
-          externalPositionId: action.externalPositionId,
-          source: 'webhook',
-          rawPayload: { signal: body.signal, symbol, price }
-        });
-        nextOpen = null;
-      } else {
-        const externalPositionId = `tv-${symbol}-${Date.now()}`;
-        tradeQueue.push({
-          sourceAccountId: account.id,
-          eventType: 'position_opened',
-          symbol,
-          side: action.side,
-          size,
-          price,
-          sl: null,
-          tp: null,
-          externalPositionId,
-          source: 'webhook',
-          rawPayload: { signal: body.signal, symbol, size, price }
-        });
-        nextOpen = { side: action.side, externalPositionId };
+    const outcome = await withTradingViewLock(key, async () => {
+      let state = tvOpenPositions.get(key);
+      if (state === undefined) {
+        const openEvents = await tradeEventService.findOpenTradingViewPositions(account.id, symbol);
+        let runnerEntryPrice = null;
+        if (openEvents.length === 1) {
+          const openedEvent = await tradeEventService.findOpenEventByExternalId(account.id, openEvents[0].externalPositionId);
+          runnerEntryPrice = openedEvent ? openedEvent.price : openEvents[0].price;
+        }
+        state = tradingViewSignalService.rebuildState(openEvents, runnerEntryPrice);
       }
-    }
-    tvOpenPositions.set(key, nextOpen);
 
-    return res.status(200).json({ received: true, actions: actions.map((a) => `${a.type} ${a.side}`) });
+      const plan = body.signal === 'PRICE'
+        ? tradingViewSignalService.planPrice(state, price)
+        : tradingViewSignalService.planEntry(state, side, price, `tv-${symbol}-${Date.now()}`);
+
+      for (const action of plan.actions) {
+        if (action.type === 'close') {
+          tradeQueue.push({
+            sourceAccountId: account.id,
+            eventType: 'position_closed',
+            symbol,
+            side: null,
+            size: null,
+            price,
+            sl: null,
+            tp: null,
+            externalPositionId: action.externalPositionId,
+            source: 'webhook',
+            rawPayload: { signal: body.signal, symbol, price }
+          });
+        } else if (action.type === 'modify') {
+          tradeQueue.push({
+            sourceAccountId: account.id,
+            eventType: 'position_modified',
+            symbol,
+            side: action.side,
+            size: null,
+            price,
+            sl: action.sl,
+            tp: null,
+            externalPositionId: action.externalPositionId,
+            source: 'webhook',
+            rawPayload: { signal: body.signal, symbol, price, sl: action.sl }
+          });
+        } else {
+          tradeQueue.push({
+            sourceAccountId: account.id,
+            eventType: 'position_opened',
+            symbol,
+            side: action.side,
+            size,
+            price,
+            sl: null,
+            tp: null,
+            externalPositionId: action.externalPositionId,
+            source: 'webhook',
+            rawPayload: { signal: body.signal, symbol, size, price, leg: action.leg }
+          });
+        }
+      }
+      tvOpenPositions.set(key, plan.nextState);
+
+      if (plan.actions.length === 0) {
+        return { ignored: plan.ignored };
+      }
+      return { actions: plan.actions.map((a) => (a.sl ? `${a.type} sl=${a.sl}` : `${a.type} ${a.side}`)) };
+    });
+
+    return res.status(200).json({ received: true, ...outcome });
   } catch (error) {
     console.error('TradingView webhook failed:', error.message);
     return res.status(500).json({ error: 'Unable to process signal.' });

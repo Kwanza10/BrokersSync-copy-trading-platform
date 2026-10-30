@@ -146,17 +146,18 @@ async function findRecentDuplicate({ sourceAccountId, eventType, externalPositio
   return result.rows[0] ? toDTO(result.rows[0]) : null;
 }
 
-// Latest indicator (TradingView) event for one symbol on one account. Used to
-// rebuild "is a position open right now?" after a server restart.
-async function findLatestTradingViewEvent(sourceAccountId, symbol) {
+// Indicator (TradingView) positions still open for one symbol on one account:
+// the latest event per position id, minus the ones already closed. Used to
+// rebuild "what is open right now?" after a server restart.
+async function findOpenTradingViewPositions(sourceAccountId, symbol) {
   const result = await db.query(
-    `SELECT * FROM copy_trade_events
+    `SELECT DISTINCT ON (external_position_id) *
+     FROM copy_trade_events
      WHERE source_account_id = $1 AND symbol = $2 AND external_position_id LIKE 'tv-%'
-     ORDER BY received_at DESC
-     LIMIT 1`,
+     ORDER BY external_position_id, received_at DESC`,
     [sourceAccountId, symbol]
   );
-  return result.rows[0] ? toDTO(result.rows[0]) : null;
+  return result.rows.filter((row) => row.event_type !== 'position_closed').map(toDTO);
 }
 
 async function updateStatus(id, status) {
@@ -182,6 +183,6 @@ module.exports = {
   findOpenEventByExternalId,
   getOpenPositionsForAccount,
   findRecentDuplicate,
-  findLatestTradingViewEvent,
+  findOpenTradingViewPositions,
   toDTO
 };
