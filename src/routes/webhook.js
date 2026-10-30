@@ -2,6 +2,7 @@ const express = require('express');
 const brokerAccountService = require('../services/brokerAccountService');
 const tradeEventService = require('../services/tradeEventService');
 const tradeQueue = require('../lib/tradeQueue');
+const tradingViewSignalService = require('../services/tradingViewSignalService');
 
 const router = express.Router();
 
@@ -100,6 +101,105 @@ router.post('/trade', async (req, res) => {
     source: 'webhook',
     rawPayload: req.body
   });
+});
+
+// TradingView alerts cannot send custom headers, so this route takes the
+// account's webhook token inside the JSON body instead (alerts only go out over
+// HTTPS, and the token is only ever sent to this server).
+// Body: { token, signal: BUY | SELL | LS_UP | LS_DOWN, symbol, size, price? }
+// In memory: which position this route opened last, per account + symbol.
+// (After a restart it is rebuilt from the saved events.)
+const tvOpenPositions = new Map();
+
+router.post('/tradingview', async (req, res) => {
+  const body = req.body || {};
+  const validationError = tradingViewSignalService.validateSignalPayload(body);
+  if (validationError) {
+    return res.status(400).json({ error: validationError });
+  }
+
+  let account;
+  try {
+    account = await brokerAccountService.getBrokerAccountByWebhookToken(body.token);
+  } catch (error) {
+    console.error('TradingView webhook token lookup failed:', error.message);
+    return res.status(500).json({ error: 'Unable to verify webhook token.' });
+  }
+  if (!account || account.status !== 'active') {
+    return res.status(401).json({ error: 'Invalid or inactive webhook token.' });
+  }
+  if (account.role !== 'master' && account.role !== 'both') {
+    return res.status(403).json({ error: 'This account is not a master account.' });
+  }
+
+  brokerAccountService.touchLastSeen(account.id).catch((error) => {
+    console.error('Failed to update last-seen for TradingView account', account.id, error.message);
+  });
+
+  const symbol = body.symbol.toUpperCase();
+  const side = tradingViewSignalService.SIGNAL_SIDES[body.signal];
+  const size = Number(body.size);
+  const price = body.price === undefined || body.price === null ? null : Number(body.price);
+  const key = `${account.id}|${symbol}`;
+
+  try {
+    let open = tvOpenPositions.get(key);
+    if (open === undefined) {
+      const latest = await tradeEventService.findLatestTradingViewEvent(account.id, symbol);
+      open = latest && latest.eventType !== 'position_closed'
+        ? { side: latest.side, externalPositionId: latest.externalPositionId }
+        : null;
+    }
+
+    const actions = tradingViewSignalService.planActions(open, side);
+    if (actions.length === 0) {
+      tvOpenPositions.set(key, open);
+      return res.status(200).json({ received: true, ignored: `a ${side} position is already open` });
+    }
+
+    // Set before any await below so a second alert in the same instant sees the new state
+    let nextOpen = open;
+    for (const action of actions) {
+      if (action.type === 'close') {
+        tradeQueue.push({
+          sourceAccountId: account.id,
+          eventType: 'position_closed',
+          symbol,
+          side: null,
+          size: null,
+          price,
+          sl: null,
+          tp: null,
+          externalPositionId: action.externalPositionId,
+          source: 'webhook',
+          rawPayload: { signal: body.signal, symbol, price }
+        });
+        nextOpen = null;
+      } else {
+        const externalPositionId = `tv-${symbol}-${Date.now()}`;
+        tradeQueue.push({
+          sourceAccountId: account.id,
+          eventType: 'position_opened',
+          symbol,
+          side: action.side,
+          size,
+          price,
+          sl: null,
+          tp: null,
+          externalPositionId,
+          source: 'webhook',
+          rawPayload: { signal: body.signal, symbol, size, price }
+        });
+        nextOpen = { side: action.side, externalPositionId };
+      }
+    }
+    tvOpenPositions.set(key, nextOpen);
+
+    return res.status(200).json({ received: true, actions: actions.map((a) => `${a.type} ${a.side}`) });
+  } catch (error) {
+    console.error('TradingView webhook failed:', error.message);
+    return res.status(500).json({ error: 'Unable to process signal.' });
+  }
 });
 
 module.exports = router;
