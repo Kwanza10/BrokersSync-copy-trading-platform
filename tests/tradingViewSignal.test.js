@@ -8,6 +8,7 @@ const {
   RUNNER_ACTIVATE_DISTANCE,
   RUNNER_TRAIL_DISTANCE
 } = require('../src/services/tradingViewSignalService');
+const { closeQtyFor } = require('../src/services/copyEngine');
 
 const pair = (side = 'buy', entryPrice = 3000) => ({
   side,
@@ -136,4 +137,11 @@ test('validates the alert payload', () => {
   assert.match(validateSignalPayload({ ...ok, price: undefined }), /price/);
   assert.match(validateSignalPayload({ ...ok, token: undefined }), /token/);
   assert.match(validateSignalPayload({ ...ok, symbol: '' }), /symbol/);
+});
+
+test('TradeLocker closes leg 1 by its size and everything else in full', () => {
+  assert.strictEqual(closeQtyFor('tv-XAUUSD-1793-1', { calculatedSize: 0.05 }), 0.05);
+  assert.strictEqual(closeQtyFor('tv-XAUUSD-1793-2', { calculatedSize: 0.05 }), 0);
+  assert.strictEqual(closeQtyFor('12345', { calculatedSize: 0.05 }), 0);
+  assert.strictEqual(closeQtyFor('tv-XAUUSD-1793-1', { calculatedSize: 0 }), 0);
 });
